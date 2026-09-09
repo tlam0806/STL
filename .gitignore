@@ -18,3 +18,7 @@ compile_commands.json
 
 # macOS
 .DS_Store
+
+# Unfinished implementations kept locally
+/Concurrency/
+/InplaceFunction/
