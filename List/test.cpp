@@ -1,3 +1,7 @@
+// Build from the repository root, then run /tmp/list-tests:
+// clang++ -std=c++20 -O1 -g -fsanitize=address,undefined
+//   -fno-sanitize-recover=all List/test.cpp -o /tmp/list-tests
+// Runtime tests use child processes on macOS/Linux to isolate crashes.
 #include "List.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +13,10 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <stdexcept>
+#include <cerrno>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static_assert(
     std::is_same_v<
@@ -22,13 +30,8 @@ static_assert(
         List<int>&>,
     "move assignment must return List&");
 
-static_assert(
-    std::is_nothrow_move_constructible_v<List<int>>,
-    "move construction should be noexcept");
-
-static_assert(
-    std::is_nothrow_move_assignable_v<List<int>>,
-    "move assignment should be noexcept");
+// Moves may either avoid throwing operations or propagate exceptions. Do not
+// require noexcept without verifying that the implementation can honor it.
 
 namespace {
 
@@ -324,16 +327,209 @@ void lifetime_test() {
     }
 }
 
+#define CHECK(expression) do { if (!(expression)) fail(#expression, __LINE__); } while (false)
+
+void empty_list_has_no_elements() {
+    CHECK(Tracked::alive == 0);
+    {
+        List<Tracked> values;
+        CHECK(values.empty());
+        CHECK(Tracked::alive == 0); // A sentinel must not construct a T.
+        values.push_back(Tracked{7});
+        CHECK(Tracked::alive == values.size());
+        values.erase(values.begin());
+        CHECK(values.empty());
+        CHECK(Tracked::alive == 0);
+    }
+    CHECK(Tracked::alive == 0);
+}
+
+void const_access_is_read_only() {
+    using C = List<int>;
+    constexpr bool readonly_iterator = !std::is_assignable_v<
+        decltype(*std::declval<const C&>().begin()), int>;
+    constexpr bool readonly_front = !std::is_assignable_v<
+        decltype(std::declval<const C&>().front()), int>;
+    constexpr bool readonly_back = !std::is_assignable_v<
+        decltype(std::declval<const C&>().back()), int>;
+    CHECK(readonly_iterator);
+    CHECK(readonly_front);
+    CHECK(readonly_back);
+    C values{1, 2};
+    values.front() = 3;
+    values.back() = 4;
+    const C& view = values;
+    CHECK(view.front() == 3);
+    CHECK(view.back() == 4);
+}
+
+struct ThrowingDefault {
+    static inline bool fail_default = false;
+    int value = 0;
+    ThrowingDefault() {
+        if (fail_default) throw std::runtime_error("injected default-constructor failure");
+    }
+    explicit ThrowingDefault(int n) : value(n) {}
+};
+
+template<bool Assign>
+void move_does_not_terminate() {
+    List<ThrowingDefault> source;
+    source.push_back(ThrowingDefault{7});
+    List<ThrowingDefault> destination;
+    destination.push_back(ThrowingDefault{9});
+    ThrowingDefault::fail_default = true;
+    bool threw = false;
+    try {
+        if constexpr (Assign) {
+            destination = std::move(source);
+            CHECK(destination.size() == 1);
+            CHECK(destination.front().value == 7);
+        } else {
+            List<ThrowingDefault> moved(std::move(source));
+            CHECK(moved.size() == 1);
+            CHECK(moved.front().value == 7);
+        }
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    ThrowingDefault::fail_default = false;
+    // Either avoid default-constructing T during move or propagate its failure.
+    // Calling terminate through an incorrect noexcept declaration is a failure.
+    if (threw) {
+        CHECK(source.size() == 1);
+        CHECK(source.front().value == 7);
+        CHECK(destination.front().value == 9);
+    }
+    source.push_back(ThrowingDefault{8});
+    CHECK(source.back().value == 8);
+}
+
+struct ThrowingCopy {
+    static inline int alive = 0;
+    static inline int copies = 0;
+    static inline int fail_copy = 0;
+    int value = 0;
+    ThrowingCopy() { ++alive; }
+    explicit ThrowingCopy(int n) : value(n) { ++alive; }
+    ThrowingCopy(const ThrowingCopy& other) : value(other.value) {
+        if (++copies == fail_copy) throw std::runtime_error("injected copy failure");
+        ++alive;
+    }
+    ThrowingCopy(ThrowingCopy&& other) noexcept : value(other.value) { ++alive; }
+    ~ThrowingCopy() { --alive; }
+};
+
+void failed_copy_cleans_up() {
+    CHECK(ThrowingCopy::alive == 0);
+    {
+        List<ThrowingCopy> source;
+        source.push_back(ThrowingCopy{1});
+        source.push_back(ThrowingCopy{2});
+        const int before = ThrowingCopy::alive;
+        ThrowingCopy::copies = 0;
+        ThrowingCopy::fail_copy = 2;
+        bool threw = false;
+        try { List<ThrowingCopy> copy(source); }
+        catch (const std::runtime_error&) { threw = true; }
+        ThrowingCopy::fail_copy = 0;
+        CHECK(threw);
+        CHECK(ThrowingCopy::alive == before);
+        CHECK(source.size() == 2);
+        CHECK(source.front().value == 1);
+        CHECK(source.back().value == 2);
+    }
+    CHECK(ThrowingCopy::alive == 0);
+}
+
+void failed_insert_preserves_links() {
+    List<ThrowingCopy> values;
+    values.push_back(ThrowingCopy{1});
+    values.push_back(ThrowingCopy{2});
+    ThrowingCopy candidate{3};
+    const int before = ThrowingCopy::alive;
+    ThrowingCopy::copies = 0;
+    ThrowingCopy::fail_copy = 1;
+    bool threw = false;
+    try { values.insert(iterator_at(values, 1), candidate); }
+    catch (const std::runtime_error&) { threw = true; }
+    ThrowingCopy::fail_copy = 0;
+    CHECK(threw);
+    CHECK(ThrowingCopy::alive == before);
+    CHECK(values.size() == 2);
+    CHECK(values.front().value == 1);
+    CHECK(values.back().value == 2);
+    CHECK((*iterator_at(values, 1)).value == 2);
+    CHECK(iterator_at(values, 2) == values.end());
+}
+
+struct NonDefault {
+    NonDefault() = delete;
+    explicit NonDefault(int n) : value(n) {}
+    int value;
+};
+void non_default_constructible_elements() {
+    List<NonDefault> values;
+    values.push_back(NonDefault{7});
+    CHECK(values.front().value == 7);
+    values.erase(values.begin());
+    CHECK(values.empty());
+}
+
+template<class Function>
+bool run_test(const char* name, Function function) {
+    std::cout.flush();
+    std::cerr.flush();
+    const pid_t child = fork();
+    if (child < 0) {
+        std::cerr << "[FAIL] " << name << ": fork failed\n";
+        return false;
+    }
+    if (child == 0) {
+        alarm(30);
+        int result = 0;
+        try { function(); }
+        catch (const std::exception& error) {
+            std::cerr << "[DETAIL] " << name << ": " << error.what() << '\n';
+            result = 1;
+        }
+        catch (...) { result = 1; }
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(result);
+    }
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    const bool passed = waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    std::cout << (passed ? "[PASS] " : "[FAIL] ") << name;
+    if (waited == child && WIFSIGNALED(status)) std::cout << " (signal " << WTERMSIG(status) << ')';
+    std::cout << '\n';
+    return passed;
+}
+
 } // namespace
 
 int main() {
-    constructor_tests();
-    deterministic_tests();
-    randomized_stress();
-    copy_independence_test();
-    copy_assignment_tests();
-    move_constructor_tests();
-    move_assignment_tests();
-    lifetime_test();
-    std::cout << "List stress test passed\n";
+    int failures = 0;
+    failures += !run_test("constructors", constructor_tests);
+    failures += !run_test("deterministic operations", deterministic_tests);
+    failures += !run_test("randomized differential", randomized_stress);
+    failures += !run_test("copy independence", copy_independence_test);
+    failures += !run_test("copy assignment", copy_assignment_tests);
+    failures += !run_test("move construction", move_constructor_tests);
+    failures += !run_test("move assignment", move_assignment_tests);
+    failures += !run_test("element lifetime cleanup", lifetime_test);
+    failures += !run_test("empty list constructs no elements", empty_list_has_no_elements);
+    failures += !run_test("const access", const_access_is_read_only);
+    failures += !run_test("move constructor exception", move_does_not_terminate<false>);
+    failures += !run_test("move assignment exception", move_does_not_terminate<true>);
+    failures += !run_test("failed copy cleanup", failed_copy_cleans_up);
+    failures += !run_test("failed insertion preserves links", failed_insert_preserves_links);
+    failures += !run_test("non-default-constructible elements", non_default_constructible_elements);
+    if (failures) {
+        std::cerr << failures << " test(s) failed\n";
+        return 1;
+    }
+    std::cout << "All enabled List tests passed\n";
 }
