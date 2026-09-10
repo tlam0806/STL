@@ -9,6 +9,7 @@
 #include<stdexcept>
 #include<type_traits>
 #include<utility>
+#include<stdexcept>
 
 template<class Key, class Value, class Hash>
 concept RobinHoodCompatible =
@@ -97,20 +98,16 @@ public :
     using const_iterator = basic_iterator<true>;
 
     explicit RobinHood(std::size_t bucket_size = INITIAL_BUCKET_SIZE) :
-        elements_{nullptr},
-        distances_{nullptr},
-        bucket_size_{bucket_size == 0 ? INITIAL_BUCKET_SIZE : bucket_size},
+        elements_{allocate_raw<Element>(bucket_size)},
+        distances_{allocate_raw<std::size_t>(bucket_size)},
+        bucket_size_{bucket_size},
         element_size_{0},
         hasher_{}
     {
-        elements_ = allocate_raw<Element>(bucket_size_);
-        try {
-            distances_ = allocate_raw<std::size_t>(bucket_size_);
-        } catch (...) {
-            std::allocator<Element>{}.deallocate(elements_, bucket_size_);
-            throw;
+        if (bucket_size == 0) {
+            throw std::invalid_argument("bucket size must be greater than zero");
         }
-        std::fill_n(distances_, bucket_size_, EMPTY_SENTINEL);
+        std::fill_n(distances_.get(), bucket_size_, EMPTY_SENTINEL);
     }
 
     RobinHood(const RobinHood& other) :
@@ -214,8 +211,6 @@ public :
 
     ~RobinHood() {
         erase_all();
-        std::allocator<Element>{}.deallocate(elements_, bucket_size_);
-        std::allocator<std::size_t>{}.deallocate(distances_, bucket_size_);
     }
 
 private : 
@@ -226,9 +221,30 @@ private :
     static constexpr std::size_t LOAD_NUMERATOR = 3;
     static constexpr std::size_t LOAD_DENOMINATOR = 4;
 
-    template<typename U>
-    U* allocate_raw(std::size_t count) const {
-        return std::allocator<U>{}.allocate(count);
+    // template<typename U>
+    // U* allocate_raw(std::size_t count) const {
+    //     return std::allocator<U>{}.allocate(count);
+    // }
+
+    template<typename T>
+    struct raw_deleter {
+        std::size_t count;
+
+        void operator()(T* pointer) {
+            std::allocator<T>{}.deallocate(pointer, count);
+        }
+    };
+
+    template<typename T>
+    using RawBuffer = std::unique_ptr<T[], raw_deleter<T>>;
+
+    template<typename T> 
+    static RawBuffer<T> allocate_raw(std::size_t count) {
+        T* pointer = std::allocator<T>{}.allocate(count);
+        raw_deleter<T> deleter{count};
+        return RawBuffer<T>{
+            pointer, deleter
+        };
     }
 
     std::size_t first_index() const {
@@ -290,7 +306,7 @@ private :
             inserted = index;
         }
         std::construct_at(
-            elements_ + index,
+            elements_.get() + index,
             std::move(incoming)
         );  
         distances_[index] = cur_distance;
@@ -301,7 +317,7 @@ private :
     void erase_all() {
         for (std::size_t i = 0; i < bucket_size_; ++i) {
             if (distances_[i] != EMPTY_SENTINEL) {
-                std::destroy_at(elements_ + i);
+                std::destroy_at(elements_.get() + i);
                 distances_[i] = EMPTY_SENTINEL;
             }
         }
@@ -348,28 +364,26 @@ private :
         std::swap(distances_, other.distances_);
         std::swap(bucket_size_, other.bucket_size_);
         std::swap(element_size_, other.element_size_);
-        // Match the ADL-aware swap checked by is_nothrow_swappable.
         using std::swap;
         swap(hasher_, other.hasher_);
     }
 
-    void shift_backward(std::size_t index) { // slot index is empty
+    void shift_backward(std::size_t index) { 
         while (true) {
             std::size_t next_index = increase_index(index);
-            if (distances_[next_index] <= STARTING_DISTANCE) { // already included distances_[nect_index] == EMPTY_SENTINEL
+            if (distances_[next_index] <= STARTING_DISTANCE) { 
                 break;
             }
             distances_[index] = distances_[next_index] - 1;
-            // Swap uses the non-throwing operation required by our concept.
             std::swap(elements_[index], elements_[next_index]);
             index = next_index;
         }
-        std::destroy_at(elements_ + index);
+        std::destroy_at(elements_.get() + index);
         distances_[index] = EMPTY_SENTINEL;
     }
 
-    Element* elements_;
-    std::size_t* distances_;
+    RawBuffer<Element> elements_;
+    RawBuffer<std::size_t> distances_;
     std::size_t bucket_size_;
     std::size_t element_size_;
     Hash hasher_;
