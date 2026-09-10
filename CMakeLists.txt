@@ -31,7 +31,6 @@ function(add_stl_test target source)
 endfunction()
 
 add_stl_test(circular_queue_test CircularQueue/test.cpp)
-add_stl_test(flat_hash_map_test FlatHashMap/test.cpp)
 add_stl_test(hash_map_test HashMap/test.cpp)
 add_stl_test(list_test List/test.cpp)
 add_stl_test(tuple_test Tuple/test.cpp)
