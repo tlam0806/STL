@@ -37,3 +37,19 @@ add_stl_test(list_test List/test.cpp)
 add_stl_test(tuple_test Tuple/test.cpp)
 add_stl_test(variant_test Variant/test.cpp)
 add_stl_test(vector_test Vector/test.cpp)
+
+option(BUILD_BENCHMARKS "Build performance benchmarks" OFF)
+
+if(BUILD_BENCHMARKS)
+    find_package(benchmark CONFIG REQUIRED)
+
+    add_executable(heap_benchmark Heap/test.cpp)
+    target_compile_features(heap_benchmark PRIVATE cxx_std_20)
+    target_compile_options(heap_benchmark PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+    )
+    target_link_libraries(heap_benchmark PRIVATE benchmark::benchmark_main)
+endif()
