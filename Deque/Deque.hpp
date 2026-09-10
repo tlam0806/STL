@@ -60,7 +60,7 @@ public :
     using iterator = BasicIterator<false>;
     using const_iterator = BasicIterator<true>;
 
-    Deque() :
+    Deque() noexcept :
         blocks_{},
         block_capacity_{0},
         offset_{0},
@@ -75,7 +75,7 @@ public :
         }
     }
 
-    Deque(Deque&& other) :
+    Deque(Deque&& other) noexcept :
         Deque()
     {
         swap(other);
@@ -86,7 +86,7 @@ public :
         return *this;
     }
 
-    void swap(Deque& other) {
+    void swap(Deque& other) noexcept {
         std::swap(blocks_, other.blocks_);
         std::swap(block_capacity_, other.block_capacity_);
         std::swap(offset_, other.offset_);
@@ -283,7 +283,7 @@ private :
         return blocks_[location.block_index_][location.element_index_in_block_];
     }
 
-    std::size_t capped_logical_index() {
+    std::size_t capped_logical_index() const noexcept {
         return block_capacity_ * BLOCK_SIZE - offset_;
     }
 
