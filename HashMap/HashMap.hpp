@@ -1,309 +1,399 @@
 #pragma once
 #include<functional>
-#include <iostream>
-#include <cassert>
-
+#include<vector>
+#include<cassert>
+#include<memory>
+#include<algorithm>
+#include<utility>
 template<
     typename Key, 
     typename Value,
     typename Hash = std::hash<Key>
->
+> 
+    requires (
+        std::is_nothrow_invocable_r_v<std::size_t, const Hash&, const Key&>
+    )
 class HashMap {
-    using value_type = std::pair<const Key, Value>;
+    using Element = std::pair<const Key, Value>;
     struct Node;
-
-public : 
-    
-    class iterator {
+    struct NodeBase;
+public :
+    template<bool IsConst>
+    class BasicIterator {
+        template<bool>
+        friend class BasicIterator;
         friend class HashMap;
-        public : 
+        using NodeBasePointer = std::conditional_t<IsConst, const NodeBase*, NodeBase*>;
+        using NodePointer = std::conditional_t<IsConst, const Node*, Node*>;
+        using reference = std::conditional_t<IsConst, const Element, Element>;
+        public :
+            explicit BasicIterator(NodeBasePointer node) noexcept :
+                node_{node}
+            {}
 
-        iterator(const HashMap* map, std::size_t bucket_index, Node* node) :
-            map_{map},
-            bucket_index_{bucket_index},
-            node_{node}
-        {}
+            template<bool OtherConst>
+                requires(IsConst && !OtherConst)
+            BasicIterator(const BasicIterator<OtherConst>& other) noexcept :
+                node_{other.node_}
+            {}
 
-        value_type& operator*() const {
-            assert(node_ != nullptr);
-            return node_->value_;
-        }
+            template<bool OtherConst> 
+            bool operator==(const BasicIterator<OtherConst>& other) const noexcept {
+                return node_ == other.node_;
+            }
 
-        value_type* operator->() const {
-            assert(node_ != nullptr);
-            return &node_->value_;
-        }
-
-        iterator& operator++() {
-            if (node_->next_ != nullptr) {
+            BasicIterator& operator++() noexcept {
                 node_ = node_->next_;
                 return *this;
             }
-            while (++bucket_index_ != map_->buckets_.size()) {
-                if (map_->buckets_[bucket_index_] != nullptr) {
-                    node_ = map_->buckets_[bucket_index_];
-                    return *this;
-                }
+
+            reference& operator*() const noexcept {
+                return static_cast<NodePointer>(node_)->element_;
             }
-            node_ = nullptr;
-            return *this; 
-        }
 
-        bool operator==(const iterator& other) const {
-            return 
-                map_ == other.map_ && 
-                bucket_index_ == other.bucket_index_ && 
-                node_ == other.node_;
-        }
-
+            reference* operator->() const noexcept {
+                return std::addressof(static_cast<NodePointer>(node_)->element_);
+            }
         private : 
-        const HashMap* map_;
-        std::size_t bucket_index_;
-        Node* node_;
+            NodeBasePointer node_;
     };
 
-    HashMap() :
-        buckets_(initial_bucket_count_, nullptr),
-        size_{0}
-    {}
+    using iterator = BasicIterator<false>;
+    using const_iterator = BasicIterator<true>;
+
+    explicit HashMap(std::size_t bucket_count = initial_bucket_capacity_) :
+        dummy_{std::make_unique<NodeBase>(nullptr)},
+        buckets_(bucket_count),
+        bucket_capacity_{bucket_count},
+        element_count_{0},
+        hasher_{}
+    {
+        assert(bucket_count > 0);
+    }
 
     HashMap(const HashMap& other) :
-        buckets_{other.buckets_.size(), nullptr},
-        size_{0}
+        HashMap(other.bucket_capacity_)
     {
-        for (const value_type& element : other) {
+        for (const auto &element : other) {
             insert(element);
         }
     }
-
-    HashMap& operator=(const HashMap& other) {
-        if (&other == this) {
-            return *this;
-        }
-        free(buckets_);
-        size_ = 0;
-        for (const value_type& element : other) {
-            insert(element);
-        }
-        return *this;
-    }   
 
     HashMap(HashMap&& other) :
-        HashMap() 
+        HashMap()
     {
         swap(other);
     }
 
-    HashMap& operator=(HashMap&& other) noexcept {
-        if (&other == this) {
-            return *this;
-        }
+    HashMap& operator=(HashMap other) noexcept {
         swap(other);
         return *this;
     }
 
-    bool empty() const {
-        return size_ == 0;
-    }
-
-    std::size_t size() const {
-        return size_;
-    }
-
-    iterator begin() const {
-        for (std::size_t index = 0; index < buckets_.size(); ++index) {
-            if (buckets_[index] != nullptr) {
-                return iterator(this, index, buckets_[index]);
-            }
+    void clear() noexcept {
+        NodeBase* cur = dummy_->next_;
+        while (cur != nullptr) {
+            NodeBase* next = cur->next_;
+            delete cur;
+            cur = next;
         }
-        return end();
+        dummy_->next_ = nullptr;
+        element_count_ = 0;
+        for (std::size_t i = 0; i < bucket_capacity_; ++i) {
+            buckets_[i].before_first_ = buckets_[i].last_ = nullptr;
+        }
     }
 
-    iterator end() const {
-        return iterator(this, buckets_.size(), nullptr);
+    ~HashMap() noexcept {
+        clear();
     }
 
-    iterator find(const Key& key) const {
-        std::size_t index = bucket_index(key);
-        Node* found_node = find_node(key, index);
-        return found_node == nullptr ? end() : iterator(this, index, found_node);
+    void swap(HashMap& other) {
+        std::swap(dummy_, other.dummy_);
+        std::swap(buckets_, other.buckets_);
+        std::swap(bucket_capacity_, other.bucket_capacity_);
+        std::swap(element_count_, other.element_count_);
+        std::swap(hasher_, other.hasher_);
     }
+
+    bool empty() const noexcept {
+        return element_count_ == 0;
+    }
+
+    std::size_t size() const noexcept {
+        return element_count_;
+    }
+
+    iterator begin() noexcept {
+        return iterator(dummy_->next_);
+    }
+    const_iterator begin() const noexcept {
+        return const_iterator(dummy_->next_);
+    }
+    const_iterator cbegin() const noexcept {
+        return const_iterator(dummy_->next_);
+    }
+
+    iterator end() noexcept {
+        return iterator(nullptr);
+    }
+    const_iterator end() const noexcept {
+        return const_iterator(nullptr);
+    }
+    const_iterator cend() const noexcept {
+        return const_iterator(nullptr);
+    }
+
 
     Value& operator[](const Key& key) {
-        std::size_t index = bucket_index(key);
-        Node* found_node = find_node(key, index);
-        if (found_node != nullptr) {
-            return found_node->value_.second;
-        }
-        try_rehash(index, key);
-        Node* new_node = new Node({key, Value()}, buckets_[index]);
-        buckets_[index] = new_node;
-        ++size_;
-        return new_node->value_.second;
+        return subscript_impl(key);
     }
 
     Value& operator[](Key&& key) {
-        std::size_t index = bucket_index(key);
-        Node* found_node = find_node(key, index);
-        if (found_node != nullptr) {
-            return found_node->value_.second;
-        }
-        try_rehash(index, key);
-        Node* new_node = new Node({std::move(key), Value()}, buckets_[index]);
-        buckets_[index] = new_node;
-        ++size_;
-        return new_node->value_.second;
+        return subscript_impl(std::move(key));
     }
 
-    iterator insert(const value_type& element) {
-        const Key& key = element.first;
-        const Value& value = element.second;
-        std::size_t index = bucket_index(key);
-        Node* found_node = find_node(key, index);
-        if (found_node != nullptr) {
-            found_node->value_.second = value;
-            return iterator(this, index, found_node);
-        }
-        try_rehash(index, key);
-        Node* new_node = new Node(element, buckets_[index]);
-        buckets_[index] = new_node;
-        ++size_;
-        return iterator(this, index, new_node);
+
+    iterator insert(const Element& element) {
+        return insert_impl(element);
     }
 
-    iterator insert(value_type&& element) {
-        const Key& key = element.first;
-        const Value& value = element.second;
-        std::size_t index = bucket_index(key);
-        Node* found_node = find_node(key, index);
-        if (found_node != nullptr) {
-            found_node->value_.second = value;
-            return iterator{this, index, found_node};
-        }
-        try_rehash(index, key);
-        Node* new_node = new Node(std::move(element), buckets_[index]);
-        buckets_[index] = new_node;
-        ++size_;
-        return iterator{this, index, new_node};
+    iterator insert(Element&& element) {
+        return insert_impl(std::move(element));
+    }
+
+    iterator find(const Key& key) { 
+        NodeBase* found = find_impl(get_bucket_index(key), key);
+        return iterator(found);
+    }
+    const_iterator find(const Key& key) const {
+        NodeBase* found = find_impl(get_bucket_index(key), key);
+        return const_iterator(found);
     }
 
     std::size_t erase(const Key& key) {
-        std::size_t index = bucket_index(key);
-        if (buckets_[index] != nullptr && buckets_[index]->value_.first == key) {
-            Node* erased_node = buckets_[index];
-            buckets_[index] = buckets_[index]->next_;
-            --size_;
-            delete erased_node;
-            return 1;
+        std::size_t bucket_index = get_bucket_index(key);
+        NodeBase* prev_found = find_prev_impl(bucket_index, key);
+        if (prev_found == nullptr) {
+            return 0;
         }
-        for (Node* cur = buckets_[index]; cur != nullptr; cur = cur->next_) {
-            if (cur->next_ != nullptr && cur->next_->value_.first == key) {
-                Node* erased_node = cur->next_;
-                cur->next_ = cur->next_->next_;
-                delete erased_node;
-                --size_;
-                return 1;   
+        Bucket& bucket = buckets_[bucket_index];
+        NodeBase* found = prev_found->next_;
+        NodeBase* next_found = found->next_;
+        assert(static_cast<Node*>(found)->element_.first == key);
+        prev_found->next_ = next_found;
+        if (found == bucket.last_) {
+            bucket.last_ = prev_found;
+            if (next_found != nullptr) {
+                std::size_t next_bucket_index = get_bucket_index(static_cast<Node*>(next_found)->element_.first);
+                assert(next_bucket_index != bucket_index);
+                buckets_[next_bucket_index].before_first_ = prev_found;
             }
         }
-        return 0;
+        if (bucket.last_ == bucket.before_first_) {
+            bucket.before_first_ = bucket.last_ = nullptr;
+        }
+        delete found;
+        --element_count_;
+        return 1;
     }
 
     iterator erase(const iterator& it) {
-        assert(it != end());
-        std::size_t index = it.bucket_index_;
-        if (buckets_[index] != nullptr && buckets_[index] == it.node_) {
-            iterator next = it; ++next;
-            Node* erased_node = buckets_[index];
-            buckets_[index] = buckets_[index]->next_;
-            delete erased_node;
-            --size_;
-            return next;
+        const Key& key = it->first;
+        std::size_t bucket_index = get_bucket_index(key);
+        NodeBase* prev_found = find_prev_impl(bucket_index, key);
+        if (prev_found == nullptr) {
+            return end();
         }
-        for (Node* cur = buckets_[index]; cur != nullptr; cur = cur->next_) {
-            if (cur->next_ == it.node_) {
-                cur->next_ = cur->next_->next_;
-                iterator next = it; ++next;
-                --size_;
-                delete it.node_;
-                return next;
+        Bucket& bucket = buckets_[bucket_index];
+        NodeBase* found = prev_found->next_;
+        assert(found == it.node_);
+        NodeBase* next_found = found->next_;
+        assert(static_cast<Node*>(found)->element_.first == key);
+        prev_found->next_ = next_found;
+        if (found == bucket.last_) {
+            bucket.last_ = prev_found;
+            if (next_found != nullptr) {
+                std::size_t next_bucket_index = get_bucket_index(static_cast<Node*>(next_found)->element_.first);
+                assert(next_bucket_index != bucket_index);
+                buckets_[next_bucket_index].before_first_ = prev_found;
             }
         }
-        return end();
-    }
-
-    void rehash(std::size_t new_bucket_count) {
-        std::vector<Node*> old_bucket{new_bucket_count, nullptr};
-        std::swap(buckets_, old_bucket);
-        size_ = 0;
-        for (Node* bucket : old_bucket) {
-            for (Node* cur = bucket; cur != nullptr; ) {
-                Node* next = cur->next_;
-                link_node(cur);
-                cur = next;
-            }
+        if (bucket.last_ == bucket.before_first_) {
+            bucket.before_first_ = bucket.last_ = nullptr;
         }
+        delete found;
+        --element_count_;
+        return iterator(next_found);
     }
 
-    ~HashMap() {
-        free(buckets_);
+    bool need_rehash() {
+        return (size() + 1 > static_cast<std::size_t>(bucket_capacity_ * max_load_factor_));
     }
 
+    void rehash(std::size_t count) {
+        std::size_t new_capacity = std::max(count, static_cast<std::size_t>(ceil((size() + 1) / max_load_factor_)));
+        if (bucket_capacity_ >= count) {
+            return;
+        }
+        HashMap other(new_capacity);
+        NodeBase* cur = dummy_->next_; 
+        while (cur != nullptr) {
+            NodeBase* next = cur->next_;
+            other.insert(cur);
+            cur = next;
+        }
+        dummy_->next_ = nullptr;
+        swap(other);
+    }
+    
 private : 
-    struct Node {
-        value_type value_;
-        Node* next_ = nullptr;
+    struct NodeBase {
+        NodeBase* next_;
+
+        explicit NodeBase(NodeBase* next) noexcept : next_{next}
+        {}
+
+        virtual ~NodeBase() = default;
+    };
+    
+    struct Node : NodeBase {
+        Element element_;
+
+        template<typename ElementInput>
+        Node(NodeBase* next, ElementInput&& element) noexcept : 
+            NodeBase(next),
+            element_{std::forward<ElementInput>(element)}
+        {}
     };
 
-    std::size_t bucket_index(const Key& key) const {
-        return hasher_(key) % buckets_.size();
+    struct Bucket {
+        NodeBase* before_first_{nullptr};
+        NodeBase* last_{nullptr};
+    };
+
+    std::size_t get_bucket_index(const Key& key) const {
+        return hasher_(key) % bucket_capacity_;
     }
 
-    Node* find_node(const Key& key, std::size_t bucket_index) const {
-        for (Node* cur = buckets_[bucket_index]; cur != nullptr; cur = cur->next_) {
-            if (cur->value_.first == key) {
+    NodeBase* find_impl(std::size_t bucket_index, const Key& key) const {
+        const Bucket& bucket = buckets_[bucket_index];
+        if (bucket.last_ == nullptr) {
+            return nullptr;
+        }
+        assert(bucket.last_ != nullptr);
+        NodeBase* cur = bucket.before_first_;
+        while (cur != bucket.last_) {
+            cur = cur->next_;
+            if (static_cast<Node*>(cur)->element_.first == key) {
                 return cur;
             }
         }
         return nullptr;
     }
 
-    void link_node(Node* node) {
-        const Key& key = node->value_.first;
-        std::size_t index = bucket_index(key);
-        node->next_ = buckets_[index];
-        buckets_[index] = node;
-        ++size_;
-    }
-
-    void try_rehash(std::size_t& index, const Key& key) {
-        if (size_ + 1 > buckets_.size() * max_load_factor_) {
-            rehash(buckets_.size() * growth_factor_);
-            index = bucket_index(key);
+    NodeBase* find_prev_impl(std::size_t bucket_index, const Key& key) {
+        Bucket& bucket = buckets_[bucket_index];
+        if (bucket.last_ == nullptr) {
+            return nullptr;
         }
-    }
-
-    void free(std::vector<Node*>& buckets) {
-        for (std::size_t i = 0; i < buckets.size(); ++i) {
-            for (Node* cur = buckets[i]; cur != nullptr;) {
-                Node* next = cur->next_;
-                delete cur;
-                cur = next;
+        NodeBase* cur = bucket.before_first_;
+        while (cur != bucket.last_) {
+            NodeBase* next = cur->next_;
+            assert(next != nullptr);
+            if (static_cast<Node*>(next)->element_.first == key) {
+                return static_cast<NodeBase*>(cur);
             }
-            buckets[i] = nullptr;
+            cur = next;
+        }
+        return nullptr;
+    }
+
+    template<typename ElementInput>
+    iterator insert_impl(ElementInput&& element) {
+        if (need_rehash()) {
+            rehash(bucket_capacity_ * 2);
+        }
+        const Key& key = element.first;
+        std::size_t bucket_index = get_bucket_index(key);
+        Bucket& bucket = buckets_[bucket_index];
+        if (bucket.last_ == nullptr) { // no bucket yet
+            NodeBase* node = new Node(dummy_->next_, std::forward<ElementInput>(element));
+            bucket.before_first_ = dummy_.get();
+            bucket.last_ = node;
+
+            if (dummy_->next_ != nullptr) {
+                NodeBase* next_node = dummy_->next_;
+                std::size_t next_bucket_index = get_bucket_index(static_cast<Node*>(next_node)->element_.first);
+                assert(next_bucket_index != bucket_index);
+                assert(buckets_[next_bucket_index].before_first_ == dummy_.get());
+                buckets_[next_bucket_index].before_first_ = node;
+            }
+            dummy_->next_ = node;
+            ++element_count_;
+            return iterator(node);
+        }
+        NodeBase* found = find_impl(bucket_index, key);
+        if (found != nullptr) {
+            static_cast<Node*>(found)->element_.second = std::forward<ElementInput>(element).second;
+            return iterator(found);
+        } else {
+            NodeBase* node = new Node(bucket.before_first_->next_, std::forward<ElementInput>(element));
+            bucket.before_first_->next_ = node;
+            ++element_count_;
+            return iterator(node);
         }
     }
 
-    void swap(HashMap& other) {
-        std::swap(buckets_, other.buckets_);
-        std::swap(size_, other.size_);
-        std::swap(hasher_, other.hasher_);
+    void insert(NodeBase* node) {
+        assert(!need_rehash());
+        const Key& key = static_cast<Node*>(node)->element_.first;
+        std::size_t bucket_index = get_bucket_index(key);
+        Bucket& bucket = buckets_[bucket_index];
+        if (bucket.last_ == nullptr) { // no bucket yet
+            // NodeBase* node = new Node(dummy_->next_, std::forward<ElementInput>(element));
+            node->next_ = dummy_->next_;
+            bucket.before_first_ = dummy_.get();
+            bucket.last_ = node;
+
+            if (dummy_->next_ != nullptr) {
+                NodeBase* next_node = dummy_->next_;
+                std::size_t next_bucket_index = get_bucket_index(static_cast<Node*>(next_node)->element_.first);
+                assert(next_bucket_index != bucket_index);
+                assert(buckets_[next_bucket_index].before_first_ == dummy_.get());
+                buckets_[next_bucket_index].before_first_ = node;
+            }
+            dummy_->next_ = node;
+            ++element_count_;
+            return;
+        }
+        assert(find_impl(bucket_index, key) == nullptr);
+        node->next_ = bucket.before_first_->next_;
+        // NodeBase* node = new Node(bucket.before_first_->next_, std::forward<ElementInput>(element));
+        bucket.before_first_->next_ = node;
+        ++element_count_;
+    }
+
+    template<typename KeyInput>
+    Value& subscript_impl(KeyInput&& key) {
+        auto it = find(key);
+        if (it != end()) {
+            return it->second;
+        }
+        return insert({std::forward<KeyInput>(key), Value{}})->second;
+    }
+
+    float load_factor() const noexcept {
+        return element_count_ / bucket_capacity_;
     }
 
     static constexpr size_t growth_factor_ = 2;
-    static constexpr size_t initial_bucket_count_ = 8;
+    static constexpr size_t initial_bucket_capacity_ = 8;
     static constexpr float max_load_factor_ = 1.7f;
 
-    std::vector<Node*> buckets_;
-    std::size_t size_;
-    Hash hasher_{};
-};  
+    std::unique_ptr<NodeBase> dummy_;
+    std::vector<Bucket> buckets_;
+    std::size_t bucket_capacity_;
+    std::size_t element_count_;
+    Hash hasher_;
+};
