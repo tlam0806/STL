@@ -8,21 +8,29 @@ struct default_deleter {
     }
 };
 
+template<typename Element>
+struct default_deleter<Element[]> {
+    void operator()(Element* pointer) const noexcept {
+        delete[] pointer;
+    }
+};
+
 template<typename T, typename Deleter = default_deleter<T>>
     requires(
         std::is_nothrow_default_constructible_v<Deleter> &&
         std::is_nothrow_move_constructible_v<Deleter> &&
         std::is_nothrow_move_assignable_v<Deleter> &&
-        std::is_nothrow_invocable_v<Deleter&, T*>
+        std::is_nothrow_invocable_v<Deleter&, std::remove_extent_t<T>*>
     )
 class unique_ptr {
+    using Element = std::remove_extent_t<T>;
 public : 
-    explicit unique_ptr(T* pointer) noexcept :
+    explicit unique_ptr(Element* pointer) noexcept :
         pointer_{pointer}, 
         deleter_{}
     {}
 
-    unique_ptr(T* pointer, Deleter deleter) noexcept : 
+    unique_ptr(Element* pointer, Deleter deleter) noexcept : 
         pointer_{pointer},
         deleter_{std::move(deleter)}
     {}
@@ -37,7 +45,9 @@ public :
 
     unique_ptr& operator=(unique_ptr&& other) noexcept {
         if (this != &other) {
-            deleter_(pointer_);
+            if (pointer_) {
+                deleter_(pointer_);
+            }
             pointer_ = std::exchange(other.pointer_, nullptr);
             deleter_ = std::move(other.deleter_);
         }
@@ -50,7 +60,7 @@ public :
         swap(deleter_, other.deleter_);
     }
 
-    T* get() const noexcept {
+    Element* get() const noexcept {
         return pointer_;
     }
 
@@ -58,11 +68,30 @@ public :
         return pointer_ != nullptr;
     }
 
-    T* release() noexcept {
+    Element& operator*() const noexcept 
+        requires(!std::is_array_v<T>)
+    {
+        return *pointer_;
+    }
+
+    Element& operator[](std::size_t index) const noexcept 
+        requires(std::is_unbounded_array_v<T>)
+    {
+        return pointer_[index];
+    }
+
+    Element* operator->() const noexcept 
+        requires(!std::is_array_v<T>) 
+    {
+        return pointer_;
+    }
+
+
+    Element* release() noexcept {
         return std::exchange(pointer_, nullptr);
     }
 
-    void reset(T* replacement = nullptr) noexcept {
+    void reset(Element* replacement = nullptr) noexcept {
         if (pointer_) {
             deleter_(pointer_);
         }
@@ -84,13 +113,23 @@ public :
         }
     }
 private :
-    T* pointer_;
+    Element* pointer_;
     [[no_unique_address]] Deleter deleter_;
 };
 
 template<typename T, typename... Args>
+    requires(!std::is_array_v<T>)
 unique_ptr<T> make_unique(Args&&... args) {
     return unique_ptr<T>{
         new T(std::forward<Args>(args)...)
+    };
+}
+
+template<typename T>
+    requires(std::is_unbounded_array_v<T>)
+unique_ptr<T> make_unique(std::size_t count) {
+    using Element = std::remove_extent_t<T>;
+    return unique_ptr<T>{
+        new Element[count]{}
     };
 }

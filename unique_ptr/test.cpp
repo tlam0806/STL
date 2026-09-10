@@ -278,6 +278,146 @@ void deleter_access() {
     equal(redirected_calls, 1, "modified deleter state is used");
 }
 
+template<class P>
+concept HasSubscript = requires(const P& p) { p[0]; };
+template<class P>
+concept HasDereference = requires(const P& p) { *p; };
+template<class P>
+concept HasArrow = requires(const P& p) { p.operator->(); };
+
+static_assert(HasSubscript<unique_ptr<int[]>>);
+static_assert(!HasSubscript<unique_ptr<int>>);
+static_assert(HasDereference<unique_ptr<int>>);
+static_assert(HasArrow<unique_ptr<int>>);
+static_assert(!HasDereference<unique_ptr<int[]>>);
+static_assert(!HasArrow<unique_ptr<int[]>>);
+static_assert(std::is_same_v<decltype(std::declval<const unique_ptr<int[]>&>()[0]), int&>);
+static_assert(std::is_same_v<decltype(std::declval<unique_ptr<int[]>&>().release()), int*>);
+static_assert(!std::is_copy_constructible_v<unique_ptr<int[]>>);
+
+struct ArrayElement {
+    static inline int alive = 0;
+    static inline int attempts = 0;
+    static inline int destroyed = 0;
+    static inline int throw_at = -1;
+    int value = 17;
+    ArrayElement() {
+        if (attempts++ == throw_at) throw std::runtime_error("array construction");
+        ++alive;
+    }
+    ~ArrayElement() { --alive; ++destroyed; }
+};
+
+void array_value_initialization() {
+    auto p = ::make_unique<int[]>(32);
+    for (int i = 0; i < 32; ++i) equal(p[i], 0, "integer array is zero initialized");
+    const auto& view = p;
+    for (int i = 0; i < 32; ++i) view[i] = i * 3;
+    for (int i = 0; i < 32; ++i) equal(p.get()[i], i * 3, "indexing accesses the owned array");
+}
+
+void array_destruction() {
+    {
+        auto p = ::make_unique<ArrayElement[]>(5);
+        equal(ArrayElement::alive, 5, "all array elements constructed");
+        for (int i = 0; i < 5; ++i) equal(p[i].value, 17, "class default constructor runs");
+    }
+    equal(ArrayElement::alive, 0, "all array elements destroyed");
+    equal(ArrayElement::destroyed, 5, "array deletion destroys each element once");
+}
+
+void array_throwing_constructor() {
+    ArrayElement::throw_at = 3;
+    bool threw = false;
+    try { auto p = ::make_unique<ArrayElement[]>(8); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    equal(ArrayElement::alive, 0, "failed array construction cleans up earlier elements");
+    equal(ArrayElement::destroyed, 3, "only completed elements are destroyed");
+}
+
+void array_move_and_reset() {
+    {
+        auto source = ::make_unique<ArrayElement[]>(3);
+        auto* address = source.get();
+        auto moved = std::move(source);
+        CHECK(!source);
+        CHECK(moved.get() == address);
+        auto destination = ::make_unique<ArrayElement[]>(2);
+        destination = std::move(moved);
+        CHECK(!moved);
+        CHECK(destination.get() == address);
+        equal(ArrayElement::alive, 3, "move assignment deletes destination's old array");
+        destination.reset(new ArrayElement[4]);
+        equal(ArrayElement::alive, 4, "reset deletes old array and owns replacement");
+        destination.reset();
+        destination.reset();
+        CHECK(!destination);
+        equal(ArrayElement::alive, 0, "reset releases the entire array");
+    }
+    equal(ArrayElement::destroyed, 9, "all three allocations are destroyed once");
+}
+
+void array_release() {
+    auto p = ::make_unique<ArrayElement[]>(3);
+    auto* raw = p.release();
+    CHECK(!p);
+    CHECK(p.release() == nullptr);
+    equal(ArrayElement::alive, 3, "release does not destroy array elements");
+    delete[] raw;
+    equal(ArrayElement::alive, 0, "caller can delete released array");
+}
+
+void array_zero_length() {
+    { auto p = ::make_unique<ArrayElement[]>(0); }
+    equal(ArrayElement::attempts, 0, "zero-length array constructs no elements");
+    equal(ArrayElement::destroyed, 0, "zero-length array destroys no elements");
+    // The allocation may return a non-null pointer; do not assert !p.
+}
+
+struct ArrayDeleter {
+    int* calls = nullptr;
+    int expected = 0;
+    void operator()(int* p) const noexcept {
+        CHECK(p != nullptr);
+        CHECK(calls != nullptr);
+        equal(p[0], expected, "array must travel with its deleter state");
+        ++*calls;
+        delete[] p;
+    }
+};
+using ArrayOwner = unique_ptr<int[], ArrayDeleter>;
+
+void array_custom_deleter() {
+    int first = 0, second = 0;
+    {
+        ArrayOwner a(new int[2]{11, 12}, ArrayDeleter{&first, 11});
+        ArrayOwner b(new int[3]{21, 22, 23}, ArrayDeleter{&second, 21});
+        a.swap(b);
+        equal(a[2], 23, "swap transfers complete array");
+        equal(b[1], 12, "swap transfers other array");
+        a = std::move(b);
+        equal(second, 1, "move assignment uses old array's deleter");
+        equal(first, 0, "transferred array remains alive");
+        CHECK(!b);
+    }
+    equal(first, 1, "transferred array uses its original deleter");
+    equal(second, 1, "old destination deleted exactly once");
+}
+
+void move_into_empty_owner() {
+    int calls = 0;
+    {
+        Owner destination(nullptr, Deleter{calls, 1});
+        Owner source(new Tracked(1), Deleter{calls, 1});
+        destination = std::move(source);
+        CHECK(!source);
+        CHECK(static_cast<bool>(destination));
+        equal(calls, 0, "move into empty owner must not call deleter on null");
+    }
+    equal(calls, 1, "transferred object deleted once");
+}
+
 struct Test { const char* name; void (*run)(); };
 bool run_test(const Test& test) {
     current_test = test.name;
@@ -310,6 +450,14 @@ bool run_test(const Test& test) {
 
 int main(int argc, char** argv) {
     const Test tests[] = {
+        {"array_value_initialization", array_value_initialization},
+        {"array_destruction", array_destruction},
+        {"array_throwing_constructor", array_throwing_constructor},
+        {"array_move_and_reset", array_move_and_reset},
+        {"array_release", array_release},
+        {"array_zero_length", array_zero_length},
+        {"array_custom_deleter", array_custom_deleter},
+        {"move_into_empty_owner", move_into_empty_owner},
         {"basic_ownership", basic_ownership}, {"empty_owner", empty_owner},
         {"forwarding", forwarding}, {"throwing_constructor", throwing_constructor},
         {"move_construction", move_construction}, {"move_assignment_deleter", move_assignment_deleter},
