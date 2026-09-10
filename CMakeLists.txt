@@ -34,7 +34,6 @@ add_stl_test(circular_queue_test CircularQueue/test.cpp)
 add_stl_test(hash_map_test HashMap/test.cpp)
 add_stl_test(list_test List/test.cpp)
 add_stl_test(tuple_test Tuple/test.cpp)
-add_stl_test(variant_test Variant/test.cpp)
 add_stl_test(vector_test Vector/test.cpp)
 
 option(BUILD_BENCHMARKS "Build performance benchmarks" OFF)

@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 template <class T>
 class Vector {
@@ -34,7 +35,7 @@ public:
             }
         } catch (...) {
             clear();
-            ::operator delete(data_);
+            deallocate_raw(data_);
             data_ = nullptr;
             capacity_ = 0;
             throw;
@@ -46,7 +47,7 @@ public:
         try {
             resize(count);
         } catch (...) {
-            ::operator delete(data_);
+            deallocate_raw(data_);
             throw;
         }
     }
@@ -56,7 +57,7 @@ public:
         try {
             resize(count, value);
         } catch (...) {
-            ::operator delete(data_);
+            deallocate_raw(data_);
             throw;
         }
     }
@@ -74,7 +75,7 @@ public:
             for (std::size_t i = 0; i < size_; i++) {
                 data_[i].~T();
             }
-            ::operator delete(data_);
+            deallocate_raw(data_);
             throw;
         }
     } 
@@ -105,7 +106,7 @@ public:
 
     ~Vector() noexcept {
         clear();
-        ::operator delete(data_);
+        deallocate_raw(data_);
     }
 
     // Element access
@@ -210,7 +211,7 @@ public:
                 for (std::size_t j = 0; j < i; ++j) {
                     new_data[j].~T();
                 }
-                ::operator delete(new_data);
+                deallocate_raw(new_data);
                 throw;
             }
         }
@@ -219,7 +220,7 @@ public:
         for (std::size_t i = 0; i < size_; i++) {
             data_[i].~T();
         }
-        ::operator delete(data_);
+        deallocate_raw(data_);
         data_ = new_data;
         capacity_ = new_capacity;
     }
@@ -339,10 +340,12 @@ public:
             reserve(next_capacity());
         }
         new (data_ + size_) T(std::move(data_[size_ - 1]));
-        for (size_type i = size_ - 1; i > index; --i) {
+        // Track the new tail before any assignment can throw. On failure the
+        // values may change, but all live elements remain owned/destructible.
+        ++size_;
+        for (size_type i = size_ - 2; i > index; --i) {
             data_[i] = std::move(data_[i - 1]);
         }
-        ++size_;
         data_[index] = std::move(tmp);
         return data_ + index;
     }
@@ -358,11 +361,13 @@ public:
             reserve(next_capacity());
         }
         new (data_ + size_) T(std::move(data_[size_ - 1]));
-        for (size_type i = size_ - 1; i > index; --i) {
+        // Track the new tail before any assignment can throw. On failure the
+        // values may change, but all live elements remain owned/destructible.
+        ++size_;
+        for (size_type i = size_ - 2; i > index; --i) {
             data_[i] = std::move(data_[i - 1]);
         }
         data_[index] = std::move(tmp);
-        ++size_;
         return data_ + index;
     }
 
@@ -372,7 +377,7 @@ public:
         }
         if (size_ == 0) {
             clear();
-            ::operator delete(data_);
+            deallocate_raw(data_);
             capacity_ = 0;
             data_ = nullptr;
             return;
@@ -387,14 +392,14 @@ public:
             for (std::size_t j = 0; j < size_; ++j) {
                 data_[j].~T();
             }
-            ::operator delete(data_);
+            deallocate_raw(data_);
             data_ = new_data;
             capacity_ = size_;
         } catch (...) {
             for (std::size_t j = 0; j < i; ++j) {
                 new_data[j].~T();
             }
-            ::operator delete(new_data);
+            deallocate_raw(new_data);
             throw;
         }
     }
@@ -414,7 +419,19 @@ private:
                 "Vector capacity exceeds max_size"
             );
         }
-        return static_cast<T*>(::operator new(count * sizeof(T)));
+        if constexpr (alignof(T) > __STDCPP_DEFAULT_NEW_ALIGNMENT__) {
+            return static_cast<T*>(::operator new(count * sizeof(T), std::align_val_t{alignof(T)}));
+        } else {
+            return static_cast<T*>(::operator new(count * sizeof(T)));
+        }
+    }
+
+    static void deallocate_raw(T* data) noexcept {
+        if constexpr (alignof(T) > __STDCPP_DEFAULT_NEW_ALIGNMENT__) {
+            ::operator delete(data, std::align_val_t{alignof(T)});
+        } else {
+            ::operator delete(data);
+        }
     }
 
     size_type next_capacity() const {
